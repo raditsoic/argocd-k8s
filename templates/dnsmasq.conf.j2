@@ -1,0 +1,19 @@
+# tiket lab DNS — serves {{ lab_domain }} locally on the host-only network,
+# forwards everything else to VirtualBox NAT's built-in resolver.
+# no-resolv is essential: cp's own /etc/resolv.conf points at dnsmasq (via
+# the host-only IP — the address k3s bakes into CoreDNS's upstream), so
+# dnsmasq must not read it for upstreams.
+no-resolv
+server=10.0.2.3
+    # 10.0.2.15 is the guest's NAT interface — VirtualBox's 5533 → 53 port
+    # forward (used for `dig @127.0.0.1 -p 5533 …` from WSL) delivers there.
+    # Listen on all three addresses. Without bind-interfaces, dnsmasq binds
+    # the wildcard (0.0.0.0:53) and only answers queries for the listed
+    # addresses, making it tolerant of interfaces that appear later (e.g.
+    # the NAT lease after a reboot).
+    listen-address=127.0.0.1,{{ hostvars['cp']['private_ip'] }},10.0.2.15
+domain={{ lab_domain }}
+{% for host in groups['all'] %}
+host-record={{ host }}.{{ lab_domain }},{{ hostvars[host]['private_ip'] }}
+{% endfor %}
+host-record=argocd.{{ lab_domain }},{{ hostvars['cp']['private_ip'] }}

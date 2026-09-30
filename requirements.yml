@@ -1,0 +1,5 @@
+---
+# Ansible collections the playbook needs beyond ansible-core.
+# Install:  ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: community.postgresql

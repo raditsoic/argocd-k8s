@@ -1,0 +1,52 @@
+---
+# Values needed by more than one play (play-level vars don't cross plays,
+# so anything shared between the db and web plays lives here).
+
+lab_domain: tiket.lab
+
+# Debian 12 (bookworm) ships PostgreSQL 15.
+pg_version: 15
+
+tiket_db:
+  name: tiketdb
+  user: tiket
+  # Actual value is vault-encrypted in vault.yml (same directory) and is
+  # decrypted automatically at run time. The vault password file is wired
+  # up in the Vagrantfile provisioner block.
+  password: "{{ vault_tiket_db_password }}"
+
+# --- Container image registry -------------------------------------------------
+# Where the app image is pulled from. After `./registry/up.sh` + the tunnel
+# are running, set registry_host to the tunnel's public hostname. While
+# testing without the tunnel, guests can reach a registry on the Windows
+# host's loopback via the VirtualBox NAT gateway (10.0.2.2) — that mode is
+# plain HTTP and needs the daemon whitelist below.
+registry_host: "10.0.2.2:5000"
+registry_user: tiket
+
+# Plain-HTTP registry addresses the guest docker daemon must whitelist.
+# Empty once pulls go through the Cloudflare tunnel (real TLS).
+registry_insecure_addresses:
+  - 10.0.2.2:5000
+
+# --- HAProxy entry point (replaces k3s Traefik) ---------------------------
+# HAProxy runs on the cp VM itself: :80 round-robins the app through the
+# NodePort on each worker; :8081 fronts the ArgoCD UI.
+node_ports:
+  app_http: 30080        # tiket-app Service NodePort (kube-proxy on every node)
+  argocd_http: 30081     # argocd-server Service NodePort, http
+  argocd_https: 30443    # argocd-server Service NodePort, https
+haproxy:
+  argocd_frontend_port: 8081
+  stats_port: 8404
+
+# --- ArgoCD ----------------------------------------------------------------
+# version: bump + re-provision upgrades (installer manifest is re-applied).
+# repo_url must be pushed and readable BEFORE first provision (public repo =
+# ArgoCD needs no credentials). path: subdir of the repo holding the app
+# manifests.
+argocd:
+  version: v3.5.3
+  repo_url: https://github.com/Raditsoic/tiket-k8s.git
+  branch: main
+  path: tiket

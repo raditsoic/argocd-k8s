@@ -1,0 +1,38 @@
+# Lab entry point — replaces k3s's bundled Traefik (k3s starts with
+# --disable=traefik). :80 round-robins the app via the NodePort service on
+# each worker; :{{ haproxy.argocd_frontend_port }} fronts the ArgoCD UI
+# (argocd-server NodePort on cp itself). TCP checks on purpose: the app's
+# / writes a visits row per GET, so HTTP health checks would fabricate rows.
+global
+    log /dev/log local0
+    maxconn 2048
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+
+frontend tiket_http
+    bind *:80
+    default_backend tiket_app
+
+frontend argocd_http
+    bind *:{{ haproxy.argocd_frontend_port }}
+    default_backend argocd
+
+backend tiket_app
+    balance roundrobin
+{% for host in groups['webservers'] %}
+    server {{ host }} {{ hostvars[host]['private_ip'] }}:{{ node_ports.app_http }} check
+{% endfor %}
+
+backend argocd
+    server cp {{ hostvars['cp']['private_ip'] }}:{{ node_ports.argocd_http }} check
+
+listen stats
+    bind *:{{ haproxy.stats_port }}
+    stats enable
+    stats uri /stats

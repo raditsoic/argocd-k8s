@@ -1,0 +1,458 @@
+---
+- name: Common setup on all machines
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+- name: Configure the shared PostgreSQL database
+  hosts: dbservers
+  become: true
+  tasks:
+    - name: Install PostgreSQL, psycopg2 (driver for the Ansible modules), acl
+      # acl = setfacl, which Ansible needs to make its temp files readable
+      # when becoming the unprivileged "postgres" user below.
+      ansible.builtin.apt:
+        name: [postgresql, python3-psycopg2, acl]
+        state: present
+
+    - name: Listen on all interfaces (Debian defaults to localhost-only)
+      ansible.builtin.lineinfile:
+        path: /etc/postgresql/{{ pg_version }}/main/postgresql.conf
+        regexp: '^#?listen_addresses\s*='
+        line: "listen_addresses = '*'"
+      notify: restart postgresql
+
+    - name: Allow the app role in from the cluster nodes and from WSL
+      # File-level edit on purpose: postgresql_pg_hba validates against a
+      # live server, but the rules must be in place before postgres accepts
+      # any remote login at all. One rule per call (users/databases are
+      # strings, not lists — a list gets written to the file literally),
+      # hence the loop. 10.0.2.2 is how WSL appears to the guest through
+      # VirtualBox's NAT port forward. Pod traffic to db leaves the cluster
+      # SNAT'd to the node's host-only IP, so the /24 covers pods too.
+      community.postgresql.postgresql_pg_hba:
+        dest: /etc/postgresql/{{ pg_version }}/main/pg_hba.conf
+        contype: host
+        users: "{{ tiket_db.user }}"
+        databases: "{{ tiket_db.name }}"
+        address: "{{ item }}"
+        method: scram-sha-256
+      loop:
+        - 192.168.56.0/24   # cluster nodes / SNAT'd pods, host-only network
+        - 10.0.2.2/32       # WSL, arriving via the NAT forward
+      notify: restart postgresql
+
+    - name: Create the app role
+      # Local socket as the postgres OS user (peer auth) — no password needed
+      # for admin work on the db host itself.
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: "{{ tiket_db.user }}"
+        password: "{{ tiket_db.password }}"
+
+    - name: Create the app database owned by the role
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: "{{ tiket_db.name }}"
+        owner: "{{ tiket_db.user }}"
+
+  handlers:
+    - name: restart postgresql
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted
+
+- name: Control plane (k3s server, dnsmasq, HAProxy entry point, ArgoCD)
+  hosts: controlplane
+  become: true
+  # Flush restart handlers even when a later task fails — otherwise a
+  # config deployed early in the play (HAProxy, dnsmasq) stays unloaded
+  # if the play dies further down, and re-provisions never re-notify it
+  # because the file is then unchanged.
+  force_handlers: true
+  tasks:
+    - name: Install dnsmasq, dig, curl and HAProxy
+      ansible.builtin.apt:
+        name: [dnsmasq, dnsutils, curl, haproxy]
+        state: present
+
+    - name: Deploy dnsmasq config for the lab domain
+      ansible.builtin.template:
+        src: templates/dnsmasq.conf.j2
+        dest: /etc/dnsmasq.d/tiket.conf
+        mode: "0644"
+      notify: restart dnsmasq
+
+    - name: Stop dhclient from rewriting resolv.conf on lease renewal
+      # dhclient rewrites /etc/resolv.conf at every renewal with whatever
+      # resolver NAT hands out, silently dropping the lab nameserver. This
+      # hook no-ops the resolv.conf writer; the copy below stays
+      # authoritative no matter what DHCP says.
+      ansible.builtin.copy:
+        dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
+        mode: "0644"
+        content: |
+          #!/bin/sh
+          # Lab DNS is static; never let dhclient-script touch resolv.conf.
+          make_resolv_conf() { :; }
+
+    - name: Point cp's resolver at dnsmasq over the host-only IP
+      # 192.168.56.10, NOT 127.0.0.1: k3s bakes the server node's resolv.conf
+      # into CoreDNS's upstream config, and CoreDNS may run on any node.
+      # 127.0.0.1 would only resolve on cp itself; the host-only address is
+      # reachable cluster-wide and dnsmasq binds it. Single entry on purpose:
+      # extra fallbacks would end up as CoreDNS upstreams that can't answer
+      # .tiket.lab names, making pod DNS flaky.
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver {{ hostvars['cp']['private_ip'] }}
+
+    - name: Create the k3s config directory
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0700"
+
+    - name: Write the containerd registry config
+      # k3s reads this at startup; later changes need the restart handler.
+      ansible.builtin.template:
+        src: templates/registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: "0600"
+      no_log: true
+      notify: restart k3s
+
+    - name: Find the host-only interface (carries the private IP)
+      ansible.builtin.shell: ip -o -4 addr show to {{ private_ip }} | awk '{print $2}'
+      register: k3s_iface_raw
+      changed_when: false
+
+    - name: Record the k3s interface
+      ansible.builtin.set_fact:
+        k3s_iface: "{{ k3s_iface_raw.stdout | trim }}"
+
+    - name: Fail when the host-only interface was not found
+      # flannel would otherwise ride the NAT interface (10.0.2.15 — the same
+      # address string on every VM, unroutable guest-to-guest).
+      ansible.builtin.assert:
+        that: k3s_iface | length > 0
+        fail_msg: no interface owns {{ private_ip }} — cannot pick flannel-iface
+
+    - name: Deploy the HAProxy config (entry point instead of Traefik)
+      ansible.builtin.template:
+        src: templates/haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        mode: "0644"
+      notify: restart haproxy
+
+    - name: Enable and start HAProxy
+      ansible.builtin.systemd:
+        name: haproxy
+        state: started
+        enabled: true
+
+    - name: Download the k3s installer
+      # Not get.k3s.io: that URL is a tiny CDN worker with recurring
+      # Cloudflare 1101 outages; GitHub raw serves the identical script and
+      # channel resolution (update.k3s.io) is a separate, unaffected API.
+      # Fetching it as a task also means a silent curl failure can no
+      # longer pass for an install (curl | sh exits 0 on empty stdin).
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/k3s-io/k3s/master/install.sh
+        dest: /opt/k3s-install.sh
+        mode: "0755"
+
+    - name: Install k3s server
+      # The installer is rerun-safe and self-healing (regenerates the unit);
+      # it brings k3s, containerd, flannel and CoreDNS. HAProxy on this VM
+      # is the lab entry point now, so the bundled Traefik addon is disabled.
+      # --node-taint keeps app pods off the control plane (k3s's packaged
+      # addons tolerate CriticalAddonsOnly); --write-kubeconfig-mode 644
+      # lets the CI deploy user run plain kubectl — lab-only convenience.
+      # The agent join token lives at /var/lib/rancher/k3s/server/node-token
+      # and is read by the agent play (delegated to cp) — not here, because
+      # `vagrant provision` runs each machine in its own playbook invocation.
+      ansible.builtin.command: >-
+        /opt/k3s-install.sh server
+        --node-ip {{ private_ip }}
+        --flannel-iface {{ k3s_iface }}
+        --node-taint CriticalAddonsOnly=true:NoExecute
+        --write-kubeconfig-mode 644
+        --disable=traefik
+      environment:
+        INSTALL_K3S_CHANNEL: stable
+
+    - name: Wait until the control-plane node is Ready
+      # kubectl wait errors out immediately (rc 1) while the node object
+      # does not exist yet — the service takes a few seconds to register
+      # it after the installer exits — so poll through NotFound.
+      ansible.builtin.command: k3s kubectl wait --for=condition=Ready node/cp --timeout=180s
+      register: cp_node_wait
+      until: cp_node_wait.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Create the app secret directory
+      # Workload manifests live in the GitOps repo (Raditsoic/tiket-k8s,
+      # applied by ArgoCD); only the Secret stays Ansible-managed because it
+      # carries vault values that must never reach GitHub.
+      ansible.builtin.file:
+        path: /opt/tiket
+        state: directory
+        mode: "0755"
+
+    - name: Deploy the app Secret (single source of the container env)
+      ansible.builtin.template:
+        src: templates/tiket-k8s/secret.yaml.j2
+        dest: /opt/tiket/secret.yaml
+        mode: "0600"
+      no_log: true
+
+    - name: Apply the app Secret
+      # kubectl apply prints only the resource name ("secret/tiket-app-env
+      # created"), never the manifest — safe to log, and the stdout is what
+      # the change detection below reads (no_log would censor the register).
+      ansible.builtin.command: k3s kubectl apply -f /opt/tiket/secret.yaml
+      register: secret_apply
+      changed_when: "'created' in secret_apply.stdout or 'configured' in secret_apply.stdout"
+
+    - name: Create the ArgoCD manifest directory
+      ansible.builtin.file:
+        path: /opt/argocd
+        state: directory
+        mode: "0755"
+
+    - name: Download the pinned ArgoCD install manifest
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd.version }}/manifests/install.yaml
+        dest: /opt/argocd/install.yaml
+        mode: "0644"
+
+    - name: Create the argocd namespace
+      ansible.builtin.shell: k3s kubectl create namespace argocd --dry-run=client -o yaml | k3s kubectl apply -f -
+      register: argocd_ns
+      changed_when: "'created' in argocd_ns.stdout"
+
+    - name: Install ArgoCD (server-side apply)
+      # SSA prints "serverside-applied" for every object on every run
+      # regardless of drift, so it is not a change signal. Plain apply would
+      # choke on re-applying the huge CRDs; SSA + --force-conflicts won't.
+      ansible.builtin.command: k3s kubectl apply -n argocd --server-side --force-conflicts -f /opt/argocd/install.yaml
+      changed_when: false
+
+    - name: Serve plain HTTP behind HAProxy
+      # Official knob: argocd-server reads server.insecure from this
+      # ConfigMap into ARGOCD_SERVER_INSECURE. No TLS anywhere in the lab —
+      # HAProxy fronts :8081 → the argocd-server NodePort :30081. Runs
+      # before the pin patches below on purpose: those change the pod
+      # template and restart the pods, so the env re-resolves. (On first
+      # provision the pods are Pending on the tainted node anyway; on
+      # re-provisions no extra restart is needed.)
+      ansible.builtin.command: k3s kubectl patch configmap argocd-cmd-params-cm -n argocd --type merge -p '{"data":{"server.insecure":"true"}}'
+      register: argocd_insecure
+      changed_when: "'patched' in argocd_insecure.stdout and '(no change)' not in argocd_insecure.stdout"
+
+    - name: List the ArgoCD workloads
+      ansible.builtin.command: k3s kubectl get deploy,statefulset -n argocd -o name
+      register: argocd_workloads
+      changed_when: false
+
+    - name: Pin ArgoCD to the tainted control plane
+      # The taint keeps app pods off cp; ArgoCD is control-plane infra, so
+      # it tolerates CriticalAddonsOnly and is pinned to cp (3 GB RAM)
+      # instead of competing with app pods on the 1 GB workers. The loop
+      # over the listed workloads keeps this correct across ArgoCD versions
+      # (v3.5.3 non-HA = 6 Deployments + 1 StatefulSet).
+      ansible.builtin.command: k3s kubectl patch -n argocd {{ item }} --type merge -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"CriticalAddonsOnly","operator":"Exists"}],"nodeSelector":{"kubernetes.io/hostname":"cp"}}}}}'
+      loop: "{{ argocd_workloads.stdout_lines }}"
+      register: argocd_pin
+      # Not a change signal: k3s tracks no managedFields for kubectl to
+      # diff against, so the SSA install pass and this patch chase each
+      # other and kubectl never reports "(no change)" here. The values
+      # converge by construction; argocd pods re-rolling on re-provision
+      # is cosmetic.
+      changed_when: false
+
+    - name: Check whether the application controller pod ever scheduled
+      # The pins change every workload's pod template. A Deployment whose
+      # pod is already Running rolls on its own, but the StatefulSet
+      # controller leaves a pod alone that never got past Pending (its
+      # first scheduling attempt failed on the taint before the pins
+      # existed) — the check below enables forcing the recreate.
+      ansible.builtin.command: k3s kubectl get pod -n argocd -l app.kubernetes.io/name=argocd-application-controller -o jsonpath='{.items[0].status.phase}'
+      register: argocd_ctrl_phase
+      changed_when: false
+
+    - name: Recreate an application controller pod stuck in Pending
+      when: argocd_ctrl_phase.stdout != "Running"
+      # Deleting it makes the StatefulSet controller start a fresh pod
+      # with the pinned template; on later provisions the pod is Running
+      # and this task is skipped.
+      ansible.builtin.command: k3s kubectl delete pod -n argocd -l app.kubernetes.io/name=argocd-application-controller --wait=false
+      changed_when: true
+
+    - name: Publish the ArgoCD server on NodePorts
+      # Strategic merge (kubectl's default) merges the ports list by its
+      # "name" key, so nodePort lands on the right entry while targetPort
+      # is retained — a JSON merge patch (--type merge) would replace each
+      # list element wholesale and reset targetPort to the port number.
+      ansible.builtin.command: k3s kubectl patch service argocd-server -n argocd -p '{"spec":{"type":"NodePort","ports":[{"name":"http","port":80,"protocol":"TCP","nodePort":{{ node_ports.argocd_http }}},{"name":"https","port":443,"protocol":"TCP","nodePort":{{ node_ports.argocd_https }}}]}}'
+      register: argocd_nodeport
+      changed_when: "'(no change)' not in argocd_nodeport.stdout"
+
+    - name: Wait until ArgoCD is up
+      # First run pulls ~1 GB of images (quay.io) through the NAT network —
+      # the timeout is generous on purpose. A timeout here is survivable:
+      # re-run `vagrant provision`; every ArgoCD task is idempotent.
+      ansible.builtin.command: k3s kubectl wait -n argocd --for=condition=Available deployment/argocd-server --timeout=600s
+      changed_when: false
+
+    - name: Wait until the application controller is rolled out
+      # argocd-server being Available says nothing about the controller
+      # StatefulSet — the sync wait below would silently time out without
+      # it. On re-provisions (no template change) this returns instantly.
+      ansible.builtin.command: k3s kubectl rollout status statefulset/argocd-application-controller -n argocd --timeout=300s
+      changed_when: false
+
+    - name: Deploy the ArgoCD Application (GitOps bootstrap)
+      ansible.builtin.template:
+        src: templates/argocd-application.yaml.j2
+        dest: /opt/argocd/application.yaml
+        mode: "0644"
+
+    - name: Apply the ArgoCD Application
+      # Retries cover the CRD-registration window right after install.
+      ansible.builtin.command: k3s kubectl apply -f /opt/argocd/application.yaml
+      register: argocd_app_apply
+      changed_when: "'created' in argocd_app_apply.stdout or 'configured' in argocd_app_apply.stdout"
+      retries: 6
+      delay: 10
+      until: argocd_app_apply.rc == 0
+
+    - name: Wait until the Application has synced the manifests repo
+      # Synced only proves the repo was readable and the objects applied;
+      # app pods stay Pending until the worker play joins the agents (vagrant
+      # provisions each machine with --limit, workers join after cp's run).
+      ansible.builtin.command: k3s kubectl wait --for=jsonpath='{.status.sync.status}'=Synced application/tiket-app -n argocd --timeout=420s
+      changed_when: false
+
+  handlers:
+    - name: restart dnsmasq
+      ansible.builtin.service:
+        name: dnsmasq
+        state: restarted
+
+    - name: restart k3s
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+
+    - name: restart haproxy
+      ansible.builtin.service:
+        name: haproxy
+        state: restarted
+
+- name: Worker nodes (k3s agents)
+  hosts: webservers
+  become: true
+  tasks:
+    - name: Install curl and dig
+      ansible.builtin.apt:
+        name: [curl, dnsutils]
+        state: present
+
+    - name: Stop dhclient from rewriting resolv.conf on lease renewal
+      # Same reason as on cp: the copy below must stay authoritative no
+      # matter what DHCP says. The app's pod DNS rides CoreDNS → cp's
+      # dnsmasq, but the node itself still resolves via these entries.
+      ansible.builtin.copy:
+        dest: /etc/dhcp/dhclient-enter-hooks.d/tiket-dns
+        mode: "0644"
+        content: |
+          #!/bin/sh
+          # Lab DNS is static; never let dhclient-script touch resolv.conf.
+          make_resolv_conf() { :; }
+
+    - name: Resolve via cp's dnsmasq first, NAT resolver as fallback
+      # Fallback matters: if cp is down or reloading, apt etc. still resolve.
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver {{ hostvars['cp']['private_ip'] }}
+          nameserver 10.0.2.3
+
+    - name: Create the k3s config directory
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0700"
+
+    - name: Write the containerd registry config
+      ansible.builtin.template:
+        src: templates/registries.yaml.j2
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: "0600"
+      no_log: true
+      notify: restart k3s-agent
+
+    - name: Find the host-only interface (carries the private IP)
+      ansible.builtin.shell: ip -o -4 addr show to {{ private_ip }} | awk '{print $2}'
+      register: k3s_iface_raw
+      changed_when: false
+
+    - name: Record the k3s interface
+      ansible.builtin.set_fact:
+        k3s_iface: "{{ k3s_iface_raw.stdout | trim }}"
+
+    - name: Fail when the host-only interface was not found
+      ansible.builtin.assert:
+        that: k3s_iface | length > 0
+        fail_msg: no interface owns {{ private_ip }} — cannot pick flannel-iface
+
+    - name: Read the join token off the control plane
+      # Delegated read, NOT a same-run cross-play fact: `vagrant provision`
+      # runs the playbook once per machine with --limit, so facts set in the
+      # cp play are never visible in this play.
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_node_token_b64
+      delegate_to: cp
+      no_log: true
+
+    - name: Decode the join token
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ k3s_node_token_b64.content | b64decode | trim }}"
+      no_log: true
+    - name: Download the k3s installer
+      # Same reasons as in the server play: get.k3s.io is unreliable, the
+      # GitHub raw copy is identical, and a task-level fetch can't
+      # silently no-op.
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/k3s-io/k3s/master/install.sh
+        dest: /opt/k3s-install.sh
+        mode: "0755"
+
+    - name: Install k3s agent and join the cluster
+      # --node-ip pins the advertised address to the host-only network for
+      # the same reason as the server flags.
+      ansible.builtin.command: >-
+        /opt/k3s-install.sh agent
+        --server https://{{ hostvars['cp']['private_ip'] }}:6443
+        --token {{ k3s_node_token }}
+        --node-ip {{ private_ip }}
+        --flannel-iface {{ k3s_iface }}
+      environment:
+        INSTALL_K3S_CHANNEL: stable
+      no_log: true
+
+  handlers:
+    - name: restart k3s-agent
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: restarted

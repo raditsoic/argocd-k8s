@@ -1,0 +1,14 @@
+# k3s/containerd registry config (replaces the docker daemon.json whitelist).
+# Written before the k3s install on every node; changes require a k3s restart
+# (handlers restart k3s / k3s-agent).
+{% if registry_insecure_addresses | length > 0 %}
+mirrors:
+  "{{ registry_host }}":
+    endpoint:
+      - "http://{{ registry_host }}"
+{% endif %}
+configs:
+  "{{ registry_host }}":
+    auth:
+      username: {{ registry_user }}
+      password: "{{ vault_registry_password }}"

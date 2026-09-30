@@ -1,0 +1,25 @@
+# The single ArgoCD Application — no app-of-apps, one app is enough here.
+# Applied by Ansible after the ArgoCD install; from then on the workload in
+# {{ argocd.repo_url }} (path {{ argocd.path }}) is deployed by GitOps.
+# The app Secret is deliberately NOT in that repo (vault values) — the
+# playbook applies it out-of-band. ArgoCD leaves untracked objects alone:
+# the default project has orphaned-resource monitoring off, so the Secret
+# is neither pruned nor flagged.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tiket-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{ argocd.repo_url }}
+    targetRevision: {{ argocd.branch }}
+    path: {{ argocd.path }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

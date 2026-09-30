@@ -1,0 +1,42 @@
+# Lab image registry, fronted by a Cloudflare tunnel so the VirtualBox
+# guests can pull over real TLS (no insecure-registries config needed).
+#
+#   bootstrap (from repo root):  ./registry/up.sh
+#   registry only:               docker compose -f registry/compose.yaml up -d
+#   with the tunnel:             put TUNNEL_TOKEN=... in registry/.env, then
+#                                docker compose --profile tunnel \
+#                                  -f registry/compose.yaml up -d
+#
+# The tunnel needs a *named* tunnel (Zero Trust dashboard → Tunnels) whose
+# public hostname routes to http://registry:5000; that hostname is what
+# goes in `registry_host` in group_vars/all/vars.yml.
+
+name: tiket-registry
+
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "127.0.0.1:5000:5000"
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: tiket-lab-registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    volumes:
+      - ./htpasswd:/auth/htpasswd:ro
+      - registry-data:/var/lib/registry
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: [tunnel]
+    command: tunnel --no-autoupdate run
+    environment:
+      # Interpolation runs for the whole file on every compose command, so
+      # the token must default empty here (only the tunnel profile uses it;
+      # cloudflared exits loudly if the token is missing at run time).
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    restart: unless-stopped
+
+volumes:
+  registry-data:
