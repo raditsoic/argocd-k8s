@@ -126,11 +126,12 @@ dig @127.0.0.1 -p 5533 argocd.tiket.lab      # → 192.168.56.10
 
 - **Change a manifest**: edit in `../tiket-k8s` (or a clone of it), push to
   `main` → ArgoCD syncs within ~3 min. That's the whole deploy story for
-  manifests.
+  manifests. (ArgoCD renders `tiket/` as a Helm chart with its bundled
+  Helm; preview locally with `helm template tiket ../tiket-k8s/tiket`.)
 - **Deploy a new app image**: a tag-bump commit to
-  `Raditsoic/tiket-k8s/tiket/deployment.yaml` (CI pushes it on every `main`
-  build — see CI/CD below). `app_version` in `group_vars` is **gone**; the
-  image tag lives in the manifests repo now.
+  `Raditsoic/tiket-k8s/tiket/values.yaml` (`image.tag`; CI pushes it on
+  every `main` build — see CI/CD below). `app_version` in `group_vars` is
+  **gone**; the image tag lives in the manifests repo now.
 - **Rollback**: `git revert` the bump/manifest commit and push — ArgoCD
   rolls the cluster back. Never `kubectl` by hand: **self-heal** reverts
   manual mutations to the repo state.
@@ -146,8 +147,8 @@ the cluster pulls from it. Two modes:
 - **Tunnel mode (normal)** — `./registry/up.sh --profile tunnel` with a
   named Cloudflare tunnel (token in `registry/.env`) publishes the registry
   at a real TLS hostname. Set `registry_host` in
-  `group_vars/all/vars.yml` to that hostname **and change the image prefix
-  in `tiket-k8s/tiket/deployment.yaml` to match** — the registry prefix is
+  `group_vars/all/vars.yml` to that hostname **and change `image.registry`
+  in `tiket-k8s/tiket/values.yaml` to match** — the registry prefix is
   baked into the manifests repo now. `registry_insecure_addresses` stays
   empty and no containerd exceptions exist.
 - **Offline/NAT mode (no Cloudflare account)** — the guests reach the
@@ -155,8 +156,8 @@ the cluster pulls from it. Two modes:
   `10.0.2.2:5000`. Plain HTTP, so `registry_insecure_addresses` must list
   it — the playbook writes `/etc/rancher/k3s/registries.yaml` (a
   containerd mirror + auth entry) on every node accordingly. This is the
-  current default, and `deployment.yaml`'s `10.0.2.2:5000/` prefix matches
-  it.
+  current default, and `values.yaml`'s `10.0.2.2:5000` `image.registry`
+  matches it.
 
 Build and publish a version (anywhere docker works):
 ```bash
@@ -171,7 +172,7 @@ same registry — the repo path is just `tiket-app`; only the transport
 address differs. For tunnel mode, tag/push with the tunnel hostname.)
 
 Deploy = commit the new tag to the manifests repo (CI does it; manually:
-edit `image:` in `tiket-k8s/tiket/deployment.yaml` and push). There are no
+edit `image.tag` in `tiket-k8s/tiket/values.yaml` and push). There are no
 liveness/readiness probes on purpose — the app's `/` writes a `visits` row
 per request, so probes would fabricate rows; rollout health is
 `kubectl rollout status` (what CI waits on).
@@ -350,9 +351,10 @@ Two ordering details that matter:
 | `requirements.yml` | Ansible collections (`community.postgresql`) |
 | `sync-keys.sh` | copies Vagrant keys from `/mnt/c` to WSL fs so chmod 600 works |
 
-The app **Deployment/Service no longer live in this repo** — they are
-`../tiket-k8s` (pushed to `github.com/Raditsoic/tiket-k8s`), deployed by
-ArgoCD. The app **Jenkinsfile** lives in the app repo.
+The app **Deployment/Service no longer live in this repo** — they are the
+Helm chart in `../tiket-k8s` (pushed to `github.com/Raditsoic/tiket-k8s`),
+rendered and deployed by ArgoCD. The app **Jenkinsfile** lives in the app
+repo.
 
 Note: every cross-node reference (agent→server join URL, CoreDNS's DNS
 upstream, resolv.conf entries, HAProxy backends) is built from each host's
@@ -372,7 +374,7 @@ something through the WSL NAT forwards.
   `Raditsoic/tiket-k8s` over SSH with the Jenkins credential
   **`tiket-manifests-deploy-key`** (the private key `~/.ssh/tiket-manifests-ci`,
   registered on GitHub as the `tiket-ci` **deploy key with write access**),
-  seds the new tag into `tiket/deployment.yaml`, commits
+  seds the new tag (`image.tag`) into `tiket/values.yaml`, commits
   `roll tiket-app to <tag>` and pushes — **that commit is the deploy**.
   ArgoCD then syncs (~3 min poll).
 - Verification is **read-only** SSH to cp (port 2210, the existing
